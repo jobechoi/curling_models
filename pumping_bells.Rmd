@@ -1,0 +1,164 @@
+---
+title: 'Practice Machine Learning with HAR Data'
+author: "John Choi"
+date: "11/11/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE, }
+knitr::opts_chunk$set(echo = T)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(repmis)
+```
+
+# Introduction  
+  
+When is the last time you did a unilateral dumbbell bicep curl? Would you know how to do it well, if asked?  
+  
+This project explores the curling of a dumbbell. It attempts to accurately classify the movements of a dumbbell curl. The datasets come from a study where six participants were asked to perform a set of 10 repetitions of a bicep curl. A bicep curl can be classified in one of five ways.  
+  
+tl;dr boosting is close to random forests in terms of error. However, boosting takes a fraction of the time.  
+    
+### Prepping the prediction model  
+Set the seed and download the datasets.  
+```{r prep}
+# Reproducibility
+set.seed(1116)
+
+# Downloads
+training<-read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"), na.strings = c("NA",""))
+validation<-read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"), na.strings = c("NA",""))
+```
+  
+### Clean up NAs  
+There are 19622 observations and 20 observations in the training and testing datasets respectively. Columns with only NAs are left behind in subsetting.  
+```{r}
+training<-training[,colSums(is.na(training))==0] 
+validation<-validation[,colSums(is.na(validation))==0]
+
+# Also subset factor and datetime variables
+training<-training[,-c(1:7)] 
+validation<-validation[,-c(1:7)]
+```
+  
+### Cross validation and resampling  
+The trainControl was set for 10-fold cross validation. Unless otherwise defined, this trainControl object is used for several of the following models.    
+```{r cross, warning=FALSE,message=FALSE}
+library(lattice)
+library(ggplot2)
+library(caret)
+# Setting train control parameters for cross validation and resampling 
+trctrl <- trainControl(method = "cv", number = 10)
+```
+  
+### Out of sample error  
+The training set was sliced into a 70/30 training and testing set. Resubstitution error should be less than that of generalization.  
+```{r slice}
+# Slice training dataset for out-of-sample error
+inTrain<-createDataPartition(training$classe, p=0.7,list=FALSE)
+training<-training[inTrain,]
+testing<-training[-inTrain,]
+```
+  
+### Predicting with trees using rpart  
+With less expectations around accuracy, this classifier helps to set a "benchmark" for the following models.  
+```{r rpart, warning=FALSE,message=FALSE}
+library(plyr)
+library(mboost)
+
+fitrpart<-train(classe~.,method="rpart",
+           data=training,
+           trControl=trctrl,
+           preProc=c("center", "scale"))
+
+predrpart<-predict(fitrpart, testing)
+confrpart<-confusionMatrix(testing$classe,predrpart)
+
+(accuracy<-confrpart$overall[1])
+```
+    
+From the course, it has been shown that classification trees perform better with predictors that are related in a nonlinear way. Considering the way the arm and body are connected, along with their possible ranges of motion, does the movement data qualify as nonlinear?  
+  
+The result of the test case exposes one of the deficiencies of this type of classifier: overfiting.    
+```{r}
+table(testrpart<-predict(fitrpart,validation))
+```  
+  
+### Boosting with gbm  
+The training set has 52 predictors which can be assumed to be discrete, given the range of motion of most human bodies, and assuming none of the six participants were contortionists. Boosting the averages, weighting them and adding them up, the 52 "weak" predictors can become fewer and stronger predictors.  
+```{r gbm}
+fitgbm<- train(classe~.,method="gbm",
+               data=training,
+               verbose=FALSE,
+               trControl=trctrl,
+               preProc=c("center", "scale"))
+
+predictgbm<- predict(fitgbm, testing)
+confgbm<- confusionMatrix(testing$classe,predictgbm)
+(accuracy<-confgbm$overall[1])
+```
+  
+Like the previous model, this model also performs cross-validation with centering and scaling during pre-processing on the data. Training with a boosting algorithm though reduces error in the training set considerably.  The results of the test case:     
+```{r}
+(testgbm<-predict(fitgbm,validation))
+```
+   
+### Random forests with rf   
+The accuracy of random forests are well understood. The time for the bootrapping, splitting, bootstrapping again, and the growing and averaging, or voting, of the trees however can be considerable.    
+```{r rf}
+fitrf<- train(classe~.,method="rf",
+               data=training,
+               verbose=FALSE,
+               trControl=trctrl,
+               preProc=c("center", "scale"))
+      
+predictrf<- predict(fitrf, testing)
+confrf<- confusionMatrix(testing$classe,predictrf)
+(accuracy<-confrf$overall[1])
+```
+  
+There is zero error with training on the random forests algorithm. The results of the test cases are identical to that of the boosting model.    
+```{r}
+(testrf<-predict(fitrf,validation))
+```
+  
+### Linear discriminant analysi with lda  
+There are 5 classes to which 1 outcome is sought from the data. LDA provides a linear regression method to this type of multiclass problem.   
+```{r lda}
+library(MASS, warn.conflicts=F, quietly=T)
+
+fitlda<- train(classe~.,method="lda",data=training)
+
+predictlda<- predict(fitlda, testing)
+conflda<- confusionMatrix(testing$classe,predictlda)
+(accuracy<-conflda$overall[1])
+```
+  
+Considering the amount of time it takes to train the model, the lda algorithm yields an impressive accuracy close to 71%. And compared with the first classifier using rpart, there is much less overfitting.  
+```{r}
+(testlda<-predict(fitlda,validation))
+```
+  
+### Model stacking with bam  
+Model stacking was introduced in the course as one way to improve accuracy from models that by themselves had high levels of error. The concept is to create a data frame from the predictions of the component models and then run the model stacking algorithm using the combined set. The results here, unlike those in the course lecture, prove much less successful.  
+```{r bam, warning=FALSE,message=FALSE}
+library(mgcv, warn.conflicts=F, quietly=T)
+
+predDF<-data.frame(predictlda,predrpart,classe=testing$classe)
+
+combofit<-train(classe~.,method="bam",data=predDF)
+
+combpred<- predict(combofit,predDF)
+combconf<- confusionMatrix(testing$classe,combpred)
+(accuracy<-combconf$overall[1])
+```
+  
+# Conclusion  
+This report has looked at the accuracy of several different classifiers. Missing is the computational time each took to train. On this, a relative time ranking is provided. The fastest and least accurate of the models was the classification tree (rpart). Slightly slower and much more accurate was linear disciminant analysis (lda). With ~3% error rate, boosting (gbm) comes in 3rd fastest. And the slowest and most accurate, with a 0% error rate, is random forests (rf). Finally, the model stacking with bam, using the predictions of rf and lda, comes in between rf and lda, but yields an accuracy below either of the constituent models, and is the lowest among the classifiers explored in this project.    
+  
+This is the test case results from the random forest model. It is identical to the boosting model's results:  
+```{r testcase}
+(testrf<-predict(fitrf,validation))
+```
